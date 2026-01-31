@@ -260,6 +260,190 @@ def validate_gsc_data(df, column_mapping):
     return True
 
 # ============================================================================
+# DATA CLEANING FUNCTIONS (from Data Cleaner)
+# ============================================================================
+
+def detect_english_text(text):
+    """
+    Check if text contains primarily English characters
+    Pattern from: Google Search Console Data Cleaner/gsc_data_cleaner.py lines 45-61
+    """
+    if pd.isna(text) or text == "":
+        return False
+
+    text = str(text)
+
+    # Count Latin characters
+    latin_chars = re.findall(r'[a-zA-Z\s]', text)
+    total_chars = len(text.replace(' ', ''))
+
+    if total_chars == 0:
+        return False
+
+    # At least 70% Latin characters
+    latin_ratio = len(''.join(latin_chars).replace(' ', '')) / total_chars
+    return latin_ratio > 0.7
+
+def is_url(text):
+    """Check if text is a URL"""
+    if pd.isna(text):
+        return False
+    text = str(text).strip()
+    return text.startswith(('http:', 'https:'))
+
+def clean_query_column(series):
+    """
+    Clean query column - remove non-English, URLs, special chars
+    Pattern from: Google Search Console Data Cleaner/gsc_data_cleaner.py lines 70-105
+    """
+    cleaned_series = series.copy()
+
+    stats = {
+        'original_count': len(cleaned_series),
+        'non_english_removed': 0,
+        'urls_removed': 0,
+        'special_chars_cleaned': 0,
+        'final_count': 0
+    }
+
+    # Remove non-English entries
+    english_mask = cleaned_series.apply(detect_english_text)
+    stats['non_english_removed'] = (~english_mask).sum()
+    cleaned_series = cleaned_series[english_mask]
+
+    # Remove URLs
+    if len(cleaned_series) > 0:
+        url_mask = cleaned_series.apply(lambda x: not is_url(x))
+        stats['urls_removed'] = (~url_mask).sum()
+        cleaned_series = cleaned_series[url_mask]
+
+    # Clean special characters
+    if len(cleaned_series) > 0:
+        original_length = len(cleaned_series)
+        cleaned_series = cleaned_series.apply(
+            lambda x: re.sub(r'[^a-zA-Z0-9\s]', '', str(x)) if pd.notna(x) else x
+        )
+        cleaned_series = cleaned_series.apply(
+            lambda x: re.sub(r'\s+', ' ', str(x).strip()) if pd.notna(x) else x
+        )
+        # Remove empty strings
+        cleaned_series = cleaned_series[cleaned_series.str.len() > 0]
+        stats['special_chars_cleaned'] = original_length - len(cleaned_series)
+
+    stats['final_count'] = len(cleaned_series)
+    return cleaned_series, stats
+
+def clean_page_column(series):
+    """
+    Clean page column - keep only HTTPS URLs
+    Pattern from: Google Search Console Data Cleaner/gsc_data_cleaner.py lines 107-123
+    """
+    cleaned_series = series.copy()
+
+    stats = {
+        'original_count': len(cleaned_series),
+        'non_https_removed': 0,
+        'final_count': 0
+    }
+
+    # Keep only URLs starting with https:
+    https_mask = cleaned_series.apply(
+        lambda x: str(x).strip().startswith('https:') if pd.notna(x) else False
+    )
+    stats['non_https_removed'] = (~https_mask).sum()
+    cleaned_series = cleaned_series[https_mask]
+    stats['final_count'] = len(cleaned_series)
+
+    return cleaned_series, stats
+
+def clean_numeric_column(series):
+    """
+    Clean numeric columns - keep only valid numbers
+    Pattern from: Google Search Console Data Cleaner/gsc_data_cleaner.py lines 125-144
+    """
+    cleaned_series = series.copy()
+
+    stats = {
+        'original_count': len(cleaned_series),
+        'non_numeric_removed': 0,
+        'final_count': 0
+    }
+
+    # Convert to numeric, coercing errors to NaN
+    numeric_series = pd.to_numeric(cleaned_series, errors='coerce')
+
+    # Remove NaN values
+    non_null_mask = numeric_series.notna()
+    stats['non_numeric_removed'] = (~non_null_mask).sum()
+    cleaned_series = numeric_series[non_null_mask]
+    stats['final_count'] = len(cleaned_series)
+
+    return cleaned_series, stats
+
+def process_dataframe(df, col_mapping):
+    """
+    Process entire dataframe with all cleaning operations
+    Pattern from: Google Search Console Data Cleaner/gsc_data_cleaner.py lines 186-247
+    """
+    cleaning_stats = {}
+    cleaned_df = df.copy()
+
+    # Track valid indices
+    original_indices = df.index.tolist()
+    valid_indices = set(original_indices)
+
+    # Clean query column
+    if col_mapping['query']:
+        cleaned_queries, query_stats = clean_query_column(df[col_mapping['query']])
+        cleaning_stats[col_mapping['query']] = query_stats
+        valid_indices = valid_indices.intersection(set(cleaned_queries.index))
+
+    # Clean page column (optional)
+    if col_mapping['page']:
+        cleaned_pages, page_stats = clean_page_column(df[col_mapping['page']])
+        cleaning_stats[col_mapping['page']] = page_stats
+        valid_indices = valid_indices.intersection(set(cleaned_pages.index))
+
+    # Clean position column
+    if col_mapping['position']:
+        cleaned_position, position_stats = clean_numeric_column(df[col_mapping['position']])
+        cleaning_stats[col_mapping['position']] = position_stats
+        valid_indices = valid_indices.intersection(set(cleaned_position.index))
+
+    # Clean clicks and impressions
+    for col_key in ['clicks', 'impressions']:
+        if col_mapping[col_key]:
+            cleaned_numeric, numeric_stats = clean_numeric_column(df[col_mapping[col_key]])
+            cleaning_stats[col_mapping[col_key]] = numeric_stats
+            valid_indices = valid_indices.intersection(set(cleaned_numeric.index))
+
+    # Filter to valid rows
+    final_indices = list(valid_indices)
+    cleaned_df = df.loc[final_indices].copy()
+
+    # Apply transformations to remaining rows
+    if col_mapping['query'] and col_mapping['query'] in cleaned_df.columns:
+        cleaned_df[col_mapping['query']] = cleaned_df[col_mapping['query']].apply(
+            lambda x: re.sub(r'[^a-zA-Z0-9\s]', '', str(x)) if pd.notna(x) else x
+        )
+        cleaned_df[col_mapping['query']] = cleaned_df[col_mapping['query']].apply(
+            lambda x: re.sub(r'\s+', ' ', str(x).strip()) if pd.notna(x) else x
+        )
+
+    if col_mapping['position'] and col_mapping['position'] in cleaned_df.columns:
+        cleaned_df[col_mapping['position']] = pd.to_numeric(
+            cleaned_df[col_mapping['position']], errors='coerce'
+        )
+
+    for col_key in ['clicks', 'impressions']:
+        if col_mapping[col_key] and col_mapping[col_key] in cleaned_df.columns:
+            cleaned_df[col_mapping[col_key]] = pd.to_numeric(
+                cleaned_df[col_mapping[col_key]], errors='coerce'
+            )
+
+    return cleaned_df, cleaning_stats
+
+# ============================================================================
 # MAIN APP
 # ============================================================================
 
@@ -365,9 +549,83 @@ def main():
         if st.session_state.raw_data is None:
             st.warning("⚠️ Please upload data in Step 1 first")
         else:
-            st.markdown("Data cleaning will be implemented in the next iteration")
-            st.info("For now, proceeding with raw data...")
-            # TODO: Implement cleaning functions
+            st.markdown("""
+            **Automatic data cleaning** removes:
+            - Non-English queries
+            - URLs in query column
+            - Special characters
+            - Non-HTTPS pages (if page column exists)
+            - Invalid numeric values
+            """)
+
+            # Get column mapping
+            col_mapping = identify_columns(st.session_state.raw_data)
+
+            # Show what will be cleaned
+            st.markdown("### Columns to Clean")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if col_mapping['query']:
+                    st.success(f"✅ Query: {col_mapping['query']}")
+                if col_mapping['position']:
+                    st.success(f"✅ Position: {col_mapping['position']}")
+            with col2:
+                if col_mapping['clicks']:
+                    st.success(f"✅ Clicks: {col_mapping['clicks']}")
+                if col_mapping['impressions']:
+                    st.success(f"✅ Impressions: {col_mapping['impressions']}")
+            with col3:
+                if col_mapping['page']:
+                    st.info(f"ℹ️ Page: {col_mapping['page']} (optional)")
+                else:
+                    st.info("ℹ️ Page column not found (optional)")
+
+            # Clean button
+            if st.button("🧹 Clean Data", type="primary", use_container_width=True):
+                with st.spinner("🧹 Cleaning data..."):
+                    cleaned_df, cleaning_stats = process_dataframe(
+                        st.session_state.raw_data,
+                        col_mapping
+                    )
+
+                    st.session_state.cleaned_data = cleaned_df
+                    st.session_state.cleaning_stats = cleaning_stats
+                    st.session_state.current_step = 3
+
+                st.success("✅ Data cleaned successfully!")
+
+                # Show cleaning statistics
+                st.markdown("### Cleaning Results")
+
+                total_original = len(st.session_state.raw_data)
+                total_cleaned = len(cleaned_df)
+                retention_rate = (total_cleaned / total_original * 100) if total_original > 0 else 0
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Original Rows", f"{total_original:,}")
+                with col2:
+                    st.metric("Cleaned Rows", f"{total_cleaned:,}")
+                with col3:
+                    st.metric("Retention Rate", f"{retention_rate:.1f}%")
+
+                # Detailed stats per column
+                with st.expander("📊 Detailed Cleaning Stats"):
+                    for col_name, stats in cleaning_stats.items():
+                        st.markdown(f"**{col_name}**")
+                        st.write(f"- Original: {stats['original_count']:,}")
+                        st.write(f"- Final: {stats['final_count']:,}")
+                        for key, value in stats.items():
+                            if key not in ['original_count', 'final_count']:
+                                st.write(f"- {key.replace('_', ' ').title()}: {value:,}")
+                        st.markdown("---")
+
+                st.info("👉 Continue to **Fetch Search Volume** tab")
+
+            # Show cleaned data if available
+            if st.session_state.cleaned_data is not None:
+                st.markdown("### Cleaned Data Preview")
+                st.dataframe(st.session_state.cleaned_data.head(10), use_container_width=True)
 
     with tab3:
         st.header("Step 3: Fetch Search Volume")
